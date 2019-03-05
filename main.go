@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/gob"
+	"net"
 
 	"fmt"
 	"log"
@@ -15,19 +16,20 @@ import (
 	"go.opencensus.io/trace"
 )
 
-type customTraceExporter struct{}
+type customTraceExporter struct {
+	Conn net.Conn
+}
 
 func logme(buffer bytes.Buffer) {
-	var sd trace.SpanData
+	var span gen.Span
 
 	dec := gob.NewDecoder(&buffer)
-	err := dec.Decode(&sd)
+	err := dec.Decode(&span)
 	if err != nil {
 		log.Fatal("decode:", err)
 	}
 
-	fmt.Printf("Name: %s\nTraceID: %x\nSpanID: %x\nParentSpanID: %x\nStartTime: %s\nEndTime: %s\nAnnotations: %+v\n\n",
-		sd.Name, sd.TraceID, sd.SpanID, sd.ParentSpanID, sd.StartTime, sd.EndTime, sd.Annotations)
+	fmt.Println("Span:", span)
 }
 
 // Copied from https://github.com/census-instrumentation/opencensus-go/blob/master/exporter/jaeger/jaeger.go
@@ -137,34 +139,76 @@ func spanDataToThrift(data *trace.SpanData) *gen.Span {
 	}
 }
 
+func (ce *customTraceExporter) Init() {
+	c, err := net.Dial("unix", "/tmp/go.sock")
+	if err != nil {
+		log.Fatal("Dial error", err)
+	}
+	ce.Conn = c
+}
+
+func (ce *customTraceExporter) Close() {
+	ce.Conn.Close()
+}
+
 func (ce *customTraceExporter) ExportSpan(sd *trace.SpanData) {
-	var network bytes.Buffer // Stand-in for a network connection
+	var network bytes.Buffer
 
 	thriftData := spanDataToThrift(sd)
 	enc := gob.NewEncoder(&network) // Will write to network.
 
-	err := enc.Encode(&thriftData)
-	if err != nil {
+	if err := enc.Encode(&thriftData); err != nil {
 		log.Fatal("encode error:", err)
 	}
 
-	dec := gob.NewDecoder(&network) // Will read from network.
-
-	var onTheOtherSide gen.Span
-	err = dec.Decode(&onTheOtherSide)
-	if err != nil {
-		log.Fatal("decode error:", err)
+	if _, err := ce.Conn.Write(network.Bytes()); err != nil {
+		log.Fatal("transmit error:", err)
 	}
 
-	fmt.Println(onTheOtherSide)
+}
+
+func hostSide(c net.Conn) {
+	for {
+		buf := make([]byte, 8192)
+		nr, err := c.Read(buf)
+		if err != nil {
+			return
+		}
+
+		data := buf[0:nr]
+		logme(*bytes.NewBuffer(data))
+	}
+}
+
+func startServer(ln net.Listener) {
+	log.Println("Starting server")
+
+	for {
+		fd, err := ln.Accept()
+		if err != nil {
+			log.Fatal("Accept error: ", err)
+		}
+
+		go hostSide(fd)
+	}
 }
 
 func main() {
 	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
 
+	ln, err := net.Listen("unix", "/tmp/go.sock")
+	if err != nil {
+		log.Fatal("Listen error: ", err)
+	}
+
+	go startServer(ln)
+
 	// Please remember to register your exporter
 	// so that it can receive exported spanData.
-	trace.RegisterExporter(new(customTraceExporter))
+	ce := &customTraceExporter{}
+	ce.Init()
+	defer ce.Close()
+	trace.RegisterExporter(ce)
 
 	for i := 0; i < 5; i++ {
 		_, span := trace.StartSpan(context.Background(), fmt.Sprintf("sample-%d", i))
