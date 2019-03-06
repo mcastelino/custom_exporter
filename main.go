@@ -14,13 +14,29 @@ import (
 	gen "github.com/mcastelino/custom_exporter/jaeger"
 
 	"go.opencensus.io/trace"
+	"google.golang.org/api/support/bundler"
 )
 
+var kataExporter *customTraceExporter
+
+// This co-mingles both the VM side and host side parts
 type customTraceExporter struct {
-	Conn net.Conn
+	// VM side only
+	Conn net.Conn // VM side, should be vsock
+
+	// Host side only
+	Client  *agentClientUDP
+	Bundler *bundler.Bundler
+
+	// Process contains the information about the exporting process.
+	// This unfortunately is currently setup hostside
+	// It works if there is a single entity being traced inside
+	// the VM. To be generic this has to be setup per Connection
+	Process *gen.Process
 }
 
-func logme(buffer bytes.Buffer) {
+// Host side
+func upload(buffer bytes.Buffer) {
 	var span gen.Span
 
 	dec := gob.NewDecoder(&buffer)
@@ -30,14 +46,17 @@ func logme(buffer bytes.Buffer) {
 	}
 
 	fmt.Println("Span:", span)
+	kataExporter.Bundler.Add(&span, 1)
 }
 
 // Copied from https://github.com/census-instrumentation/opencensus-go/blob/master/exporter/jaeger/jaeger.go
+// VM Side
 func bytesToInt64(buf []byte) int64 {
 	u := binary.BigEndian.Uint64(buf)
 	return int64(u)
 }
 
+// VM Side
 func name(sd *trace.SpanData) string {
 	n := sd.Name
 	switch sd.SpanKind {
@@ -49,6 +68,7 @@ func name(sd *trace.SpanData) string {
 	return n
 }
 
+// VM Side
 func attributeToTag(key string, a interface{}) *gen.Tag {
 	var tag *gen.Tag
 	switch value := a.(type) {
@@ -87,6 +107,8 @@ func attributeToTag(key string, a interface{}) *gen.Tag {
 	}
 	return tag
 }
+
+// VM Side
 func spanDataToThrift(data *trace.SpanData) *gen.Span {
 	tags := make([]*gen.Tag, 0, len(data.Attributes))
 	for k, v := range data.Attributes {
@@ -139,18 +161,77 @@ func spanDataToThrift(data *trace.SpanData) *gen.Span {
 	}
 }
 
+// end copy
+
+// Host side
+func (ce *customTraceExporter) upload(spans []*gen.Span) error {
+	batch := &gen.Batch{
+		Spans:   spans,
+		Process: ce.Process,
+	}
+	return ce.uploadAgent(batch)
+}
+
+// Host side
+func (ce *customTraceExporter) uploadAgent(batch *gen.Batch) error {
+	if err := ce.Client.EmitBatch(batch); err != nil {
+		return err
+	}
+	// So that we do not wait for the batch buffer to fill up
+	// ensures no spans are lost
+	ce.Bundler.Flush()
+	return nil
+}
+
+// Flush waits for exported trace spans to be uploaded.
+//
+// This is useful if your program is ending and you do not want to lose recent spans.
+// Host side
+func (ce *customTraceExporter) Flush() {
+	ce.Bundler.Flush()
+}
+
 func (ce *customTraceExporter) Init() {
+	// VM Side, needs to be vsock
 	c, err := net.Dial("unix", "/tmp/go.sock")
 	if err != nil {
 		log.Fatal("Dial error", err)
 	}
 	ce.Conn = c
+
+	// Host side
+	ce.Client, err = newAgentClientUDP("localhost:6831", udpPacketMaxLength)
+	if err != nil {
+		log.Fatal("Agent setup error", err)
+	}
+
+	bundler := bundler.NewBundler((*gen.Span)(nil), func(bundle interface{}) {
+		if err := ce.upload(bundle.([]*gen.Span)); err != nil {
+			log.Fatal("bundler error:", err)
+		}
+	})
+
+	bundler.BufferedByteLimit = udpPacketMaxLength
+	ce.Bundler = bundler
+
+	// This is hardcoded now, needs to be passed over out of band from VM to host
+	// Note: The proxy here is a per process exporter proxy
+	ce.Process = &gen.Process{
+		ServiceName: "kata-agent-proxy",
+	}
+
 }
 
 func (ce *customTraceExporter) Close() {
+	// VM side
 	ce.Conn.Close()
 }
 
+// VM Side
+// This is where the two sides are decoupled
+// The data is marshalled and sent over a VM -> host connection
+// At this point the VM is done
+// All logic beyond this point is on the host
 func (ce *customTraceExporter) ExportSpan(sd *trace.SpanData) {
 	var network bytes.Buffer
 
@@ -167,19 +248,26 @@ func (ce *customTraceExporter) ExportSpan(sd *trace.SpanData) {
 
 }
 
+// Host side primary point of contact
+// will get serialized data from VM
 func hostSide(c net.Conn) {
 	for {
-		buf := make([]byte, 8192)
+		buf := make([]byte, udpPacketMaxLength)
 		nr, err := c.Read(buf)
 		if err != nil {
 			return
 		}
 
 		data := buf[0:nr]
-		logme(*bytes.NewBuffer(data))
+		upload(*bytes.NewBuffer(data))
 	}
 }
 
+// In theory we can work with a single proxy
+// for all VM's running on the host if we can
+// create a different context for each connection.
+// For now all we do is setup a server on a specific
+// URI for a specific VM to keep things simple
 func startServer(ln net.Listener) {
 	log.Println("Starting server")
 
@@ -196,6 +284,7 @@ func startServer(ln net.Listener) {
 func main() {
 	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
 
+	// Host side
 	ln, err := net.Listen("unix", "/tmp/go.sock")
 	if err != nil {
 		log.Fatal("Listen error: ", err)
@@ -203,6 +292,7 @@ func main() {
 
 	go startServer(ln)
 
+	// VM Side
 	// Please remember to register your exporter
 	// so that it can receive exported spanData.
 	ce := &customTraceExporter{}
@@ -210,8 +300,10 @@ func main() {
 	defer ce.Close()
 	trace.RegisterExporter(ce)
 
-	for i := 0; i < 5; i++ {
-		_, span := trace.StartSpan(context.Background(), fmt.Sprintf("sample-%d", i))
+	kataExporter = ce
+
+	for i := 0; i < 10; i++ {
+		_, span := trace.StartSpan(context.Background(), fmt.Sprintf("sample-kata-%d", i))
 		span.Annotate([]trace.Attribute{trace.Int64Attribute("invocations", 1)}, "Invoked it")
 		span.End()
 		<-time.After(10 * time.Millisecond)
