@@ -8,3 +8,25 @@ backend.
 
 The default spans are unfortunately not serializeable, hence
 convert the thrift format used by jaeger
+
+# Building 
+
+```
+go build -o host host.go
+go build -o vm vm.go
+```
+
+# Running
+
+First run the proxy as it will be waiting for traces
+
+```
+rm /tmp/go.sock ; ./host
+```
+
+Then run the VM
+```
+./vm
+```
+
+When the VM terminates the proxy also terminates
